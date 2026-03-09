@@ -2,7 +2,7 @@ package affine
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -13,56 +13,77 @@ import (
 	"testing"
 )
 
-func TestImportMarkdownUsesMCPCreateDocument(t *testing.T) {
-	var authHeaders []string
-	var calls []string
+type fakeWriter struct {
+	req createDocRequest
+	err error
+}
 
-	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		authHeaders = append(authHeaders, r.Header.Get("Authorization"))
-		switch r.URL.Path {
-		case "/api/workspaces/ws-1/mcp/":
-			var req map[string]any
-			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				t.Fatal(err)
-			}
-			calls = append(calls, req["method"].(string))
-			switch req["method"] {
-			case "tools/list":
-				_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"create_document"}]}}`))
-			case "tools/call":
-				_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"{\"success\":true}"}]}}`))
-			default:
-				http.NotFound(w, r)
-			}
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer s.Close()
+func (f *fakeWriter) CreateDoc(_ context.Context, req createDocRequest) error {
+	f.req = req
+	return f.err
+}
 
+func TestImportMarkdownCreatesDocViaWriter(t *testing.T) {
+	d := t.TempDir()
+	p := filepath.Join(d, "note.md")
+	if err := os.WriteFile(p, []byte("# hello\n\nParagraph"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	writer := &fakeWriter{}
+	client := newWithWriter("http://affine", "abc", "ws-1", http.DefaultClient, writer)
+	if err := client.ImportMarkdown(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+
+	if writer.req.Title != "hello" {
+		t.Fatalf("unexpected title: %q", writer.req.Title)
+	}
+	if writer.req.Markdown != "Paragraph" {
+		t.Fatalf("unexpected markdown: %q", writer.req.Markdown)
+	}
+	if writer.req.BaseURL != "http://affine" || writer.req.Token != "abc" || writer.req.WorkspaceID != "ws-1" {
+		t.Fatalf("unexpected request: %+v", writer.req)
+	}
+}
+
+func TestImportMarkdownFallsBackToFilenameWhenNoH1(t *testing.T) {
+	d := t.TempDir()
+	p := filepath.Join(d, "note.md")
+	if err := os.WriteFile(p, []byte("Paragraph"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	writer := &fakeWriter{}
+	client := newWithWriter("http://affine", "abc", "ws-1", http.DefaultClient, writer)
+	if err := client.ImportMarkdown(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+
+	if writer.req.Title != "note" {
+		t.Fatalf("unexpected title: %q", writer.req.Title)
+	}
+	if writer.req.Markdown != "Paragraph" {
+		t.Fatalf("unexpected markdown: %q", writer.req.Markdown)
+	}
+}
+
+func TestImportMarkdownPropagatesWriterError(t *testing.T) {
 	d := t.TempDir()
 	p := filepath.Join(d, "note.md")
 	if err := os.WriteFile(p, []byte("# hello"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	client := New(s.URL, "abc", "ws-1", s.Client())
-	if err := client.ImportMarkdown(context.Background(), p); err != nil {
-		t.Fatal(err)
-	}
-
-	if len(authHeaders) != 2 || authHeaders[0] != "Bearer abc" || authHeaders[1] != "Bearer abc" {
-		t.Fatalf("unexpected auth headers: %+v", authHeaders)
-	}
-	if strings.Join(calls, ",") != "tools/list,tools/call" {
-		t.Fatalf("unexpected calls: %+v", calls)
+	writer := &fakeWriter{err: errors.New("boom")}
+	client := newWithWriter("http://affine", "abc", "ws-1", http.DefaultClient, writer)
+	if err := client.ImportMarkdown(context.Background(), p); err == nil || err.Error() != "boom" {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
 func TestImportFileUploadsBlobThenCreatesDocument(t *testing.T) {
 	var graphqlAuth string
-	var mcpCalls []string
-
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/graphql":
@@ -86,20 +107,6 @@ func TestImportFileUploadsBlobThenCreatesDocument(t *testing.T) {
 				t.Fatalf("unexpected upload body: %q", string(b))
 			}
 			_, _ = w.Write([]byte(`{"data":{"setBlob":"blob-id"}}`))
-		case "/api/workspaces/ws-1/mcp/":
-			var req map[string]any
-			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				t.Fatal(err)
-			}
-			mcpCalls = append(mcpCalls, req["method"].(string))
-			switch req["method"] {
-			case "tools/list":
-				_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"create_document"}]}}`))
-			case "tools/call":
-				_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"{\"success\":true}"}]}}`))
-			default:
-				http.NotFound(w, r)
-			}
 		default:
 			http.NotFound(w, r)
 		}
@@ -112,37 +119,19 @@ func TestImportFileUploadsBlobThenCreatesDocument(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	client := New(s.URL, "abc", "ws-1", s.Client())
+	writer := &fakeWriter{}
+	client := newWithWriter(s.URL, "abc", "ws-1", s.Client(), writer)
 	if err := client.ImportFile(context.Background(), p); err != nil {
 		t.Fatal(err)
 	}
 	if graphqlAuth != "Bearer abc" {
 		t.Fatalf("unexpected graphql auth: %q", graphqlAuth)
 	}
-	if strings.Join(mcpCalls, ",") != "tools/list,tools/call" {
-		t.Fatalf("unexpected mcp calls: %+v", mcpCalls)
+	if writer.req.Title != "a.bin" {
+		t.Fatalf("unexpected title: %q", writer.req.Title)
 	}
-}
-
-func TestImportMarkdownFailsWhenCreateDocumentToolMissing(t *testing.T) {
-	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/workspaces/ws-1/mcp/" {
-			http.NotFound(w, r)
-			return
-		}
-		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"read_document"}]}}`))
-	}))
-	defer s.Close()
-
-	d := t.TempDir()
-	p := filepath.Join(d, "note.md")
-	if err := os.WriteFile(p, []byte("# hello"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	client := New(s.URL, "abc", "ws-1", s.Client())
-	if err := client.ImportMarkdown(context.Background(), p); err == nil {
-		t.Fatal("expected error")
+	if !strings.Contains(writer.req.Markdown, "[a.bin]("+s.URL+"/api/workspaces/ws-1/blobs/blob-id)") {
+		t.Fatalf("unexpected markdown: %q", writer.req.Markdown)
 	}
 }
 

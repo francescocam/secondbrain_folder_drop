@@ -19,6 +19,7 @@ type Client struct {
 	token       string
 	workspaceID string
 	http        *http.Client
+	writer      docWriter
 }
 
 type HTTPError struct {
@@ -30,12 +31,29 @@ func (e *HTTPError) Error() string {
 	return fmt.Sprintf("http status %d: %s", e.StatusCode, e.Body)
 }
 
+type createDocRequest struct {
+	BaseURL     string `json:"baseURL"`
+	Token       string `json:"token"`
+	WorkspaceID string `json:"workspaceID"`
+	Title       string `json:"title"`
+	Markdown    string `json:"markdown"`
+}
+
+type docWriter interface {
+	CreateDoc(context.Context, createDocRequest) error
+}
+
 func New(baseURL, token, workspaceID string, hc *http.Client) *Client {
+	return newWithWriter(baseURL, token, workspaceID, hc, &nodeWriter{})
+}
+
+func newWithWriter(baseURL, token, workspaceID string, hc *http.Client, writer docWriter) *Client {
 	return &Client{
 		baseURL:     strings.TrimRight(baseURL, "/"),
 		token:       token,
 		workspaceID: workspaceID,
 		http:        hc,
+		writer:      writer,
 	}
 }
 
@@ -44,8 +62,14 @@ func (c *Client) ImportMarkdown(ctx context.Context, path string) error {
 	if err != nil {
 		return err
 	}
-	title := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-	return c.createDocument(ctx, title, string(content))
+	title, body := splitMarkdownTitle(string(content), strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)))
+	return c.writer.CreateDoc(ctx, createDocRequest{
+		BaseURL:     c.baseURL,
+		Token:       c.token,
+		WorkspaceID: c.workspaceID,
+		Title:       title,
+		Markdown:    body,
+	})
 }
 
 func (c *Client) ImportFile(ctx context.Context, path string) error {
@@ -56,58 +80,36 @@ func (c *Client) ImportFile(ctx context.Context, path string) error {
 	name := filepath.Base(path)
 	blobURL := c.baseURL + "/api/workspaces/" + url.PathEscape(c.workspaceID) + "/blobs/" + url.PathEscape(blobID)
 	content := fmt.Sprintf("Imported by folder-drop service.\n\n[%s](%s)", name, blobURL)
-	return c.createDocument(ctx, name, content)
+	return c.writer.CreateDoc(ctx, createDocRequest{
+		BaseURL:     c.baseURL,
+		Token:       c.token,
+		WorkspaceID: c.workspaceID,
+		Title:       name,
+		Markdown:    content,
+	})
 }
 
-func (c *Client) createDocument(ctx context.Context, title, content string) error {
-	if err := c.ensureCreateDocumentTool(ctx); err != nil {
-		return err
-	}
-
-	body := map[string]any{
-		"jsonrpc": "2.0",
-		"id":      2,
-		"method":  "tools/call",
-		"params": map[string]any{
-			"name": "create_document",
-			"arguments": map[string]any{
-				"title":   title,
-				"content": content,
-			},
-		},
-	}
-	var resp rpcEnvelope
-	if err := c.postJSON(ctx, c.baseURL+"/api/workspaces/"+url.PathEscape(c.workspaceID)+"/mcp/", body, &resp); err != nil {
-		return err
-	}
-	if resp.Error != nil {
-		return fmt.Errorf("affine create_document failed: %s", resp.Error.Message)
-	}
-	if resp.Result.IsError {
-		return fmt.Errorf("affine create_document returned error")
-	}
-	return nil
-}
-
-func (c *Client) ensureCreateDocumentTool(ctx context.Context) error {
-	body := map[string]any{
-		"jsonrpc": "2.0",
-		"id":      1,
-		"method":  "tools/list",
-	}
-	var resp rpcEnvelope
-	if err := c.postJSON(ctx, c.baseURL+"/api/workspaces/"+url.PathEscape(c.workspaceID)+"/mcp/", body, &resp); err != nil {
-		return err
-	}
-	if resp.Error != nil {
-		return fmt.Errorf("affine tools/list failed: %s", resp.Error.Message)
-	}
-	for _, tool := range resp.Result.Tools {
-		if tool.Name == "create_document" {
-			return nil
+func splitMarkdownTitle(markdown, fallback string) (string, string) {
+	normalized := strings.ReplaceAll(markdown, "\r\n", "\n")
+	lines := strings.Split(normalized, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
 		}
+		if strings.HasPrefix(trimmed, "# ") {
+			title := strings.TrimSpace(strings.TrimPrefix(trimmed, "# "))
+			if title == "" {
+				break
+			}
+			bodyLines := append([]string{}, lines[:i]...)
+			bodyLines = append(bodyLines, lines[i+1:]...)
+			body := strings.TrimLeft(strings.Join(bodyLines, "\n"), "\n")
+			return title, body
+		}
+		break
 	}
-	return fmt.Errorf("affine MCP tool create_document is unavailable for workspace %s", c.workspaceID)
+	return fallback, normalized
 }
 
 func (c *Client) setBlob(ctx context.Context, path string) (string, error) {
@@ -184,50 +186,10 @@ func (c *Client) setBlob(ctx context.Context, path string) (string, error) {
 	return payload.Data.SetBlob, nil
 }
 
-func (c *Client) postJSON(ctx context.Context, endpoint string, payload any, out any) error {
-	b, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(b))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 300 {
-		return &HTTPError{StatusCode: resp.StatusCode, Body: string(body)}
-	}
-	if err := json.Unmarshal(body, out); err != nil {
-		return fmt.Errorf("parse affine response: %w", err)
-	}
-	return nil
-}
-
 func writeJSONPart(mw *multipart.Writer, field string, payload any) error {
 	part, err := mw.CreateFormField(field)
 	if err != nil {
 		return err
 	}
 	return json.NewEncoder(part).Encode(payload)
-}
-
-type rpcEnvelope struct {
-	Result struct {
-		IsError bool `json:"isError"`
-		Tools   []struct {
-			Name string `json:"name"`
-		} `json:"tools"`
-	} `json:"result"`
-	Error *struct {
-		Message string `json:"message"`
-	} `json:"error"`
 }

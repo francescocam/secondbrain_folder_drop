@@ -20,7 +20,7 @@ const version = "0.1.0"
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: secondbrain-folder-drop <run|validate-config|version> [--config path]")
+		fmt.Fprintln(os.Stderr, "usage: secondbrain-folder-drop <run|validate-config|version> [--config path] [--target blinko|affine|both]")
 		os.Exit(2)
 	}
 
@@ -40,13 +40,19 @@ func main() {
 func validateConfigCmd(args []string) {
 	fs := flag.NewFlagSet("validate-config", flag.ExitOnError)
 	configPath := fs.String("config", "", "path to config file")
+	targetFlag := fs.String("target", string(config.TargetBoth), "upload target: blinko, affine, or both")
 	_ = fs.Parse(args)
 
 	if *configPath == "" {
 		log.Fatal("--config is required")
 	}
 
-	if _, err := config.Load(*configPath); err != nil {
+	target, err := config.ParseTarget(*targetFlag)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if _, err := config.LoadForTarget(*configPath, target); err != nil {
 		log.Fatalf("config invalid: %v", err)
 	}
 	fmt.Println("config is valid")
@@ -55,18 +61,24 @@ func validateConfigCmd(args []string) {
 func runCmd(args []string) {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	configPath := fs.String("config", "", "path to config file")
+	targetFlag := fs.String("target", string(config.TargetBoth), "upload target: blinko, affine, or both")
 	_ = fs.Parse(args)
 
 	if *configPath == "" {
 		log.Fatal("--config is required")
 	}
 
+	target, err := config.ParseTarget(*targetFlag)
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	runner := func(ctx context.Context) error {
-		cfg, err := config.Load(*configPath)
+		cfg, err := config.LoadForTarget(*configPath, target)
 		if err != nil {
 			return err
 		}
-		svc, err := service.New(cfg)
+		svc, err := service.New(cfg, target)
 		if err != nil {
 			return err
 		}

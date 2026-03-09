@@ -22,11 +22,12 @@ import (
 
 type Service struct {
 	cfg     config.Config
+	target  config.Target
 	metrics *metrics.Metrics
 }
 
-func New(cfg config.Config) (*Service, error) {
-	return &Service{cfg: cfg, metrics: metrics.New()}, nil
+func New(cfg config.Config, target config.Target) (*Service, error) {
+	return &Service{cfg: cfg, target: target, metrics: metrics.New()}, nil
 }
 
 func (s *Service) Run(ctx context.Context) error {
@@ -37,10 +38,15 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	hc := &http.Client{Timeout: s.cfg.HTTP.Timeout}
-	proc := processor.New([]processor.Sink{
-		blinko.New(s.cfg.Blinko.BaseURL, s.cfg.Blinko.JWTToken, hc),
-		affine.New(s.cfg.Affine.BaseURL, s.cfg.Affine.AuthToken, s.cfg.Affine.WorkspaceID, hc),
-	}, processor.Config{
+	sinks := make([]processor.Sink, 0, 2)
+	if s.target == config.TargetBoth || s.target == config.TargetBlinko {
+		sinks = append(sinks, blinko.New(s.cfg.Blinko.BaseURL, s.cfg.Blinko.JWTToken, hc))
+	}
+	if s.target == config.TargetBoth || s.target == config.TargetAffine {
+		sinks = append(sinks, affine.New(s.cfg.Affine.BaseURL, s.cfg.Affine.AuthToken, s.cfg.Affine.WorkspaceID, hc))
+	}
+
+	proc := processor.New(sinks, processor.Config{
 		DeleteOnOK: s.cfg.Processing.DeleteOnOK,
 		ArchiveDir: s.cfg.Processing.ArchiveDir,
 		FailedDir:  s.cfg.Watch.FailedDir,
@@ -100,7 +106,7 @@ func (s *Service) Run(ctx context.Context) error {
 		}
 	}()
 
-	logger("level=info msg=service_started input_dir=%q", s.cfg.Watch.InputDir)
+	logger("level=info msg=service_started input_dir=%q target=%q", s.cfg.Watch.InputDir, s.target)
 	err := q.Run(ctx)
 	if err == context.Canceled {
 		return nil

@@ -49,7 +49,30 @@ type Config struct {
 	} `yaml:"metrics"`
 }
 
+type Target string
+
+const (
+	TargetBoth   Target = "both"
+	TargetBlinko Target = "blinko"
+	TargetAffine Target = "affine"
+)
+
+func ParseTarget(raw string) (Target, error) {
+	switch target := Target(strings.ToLower(strings.TrimSpace(raw))); target {
+	case "", TargetBoth:
+		return TargetBoth, nil
+	case TargetBlinko, TargetAffine:
+		return target, nil
+	default:
+		return "", fmt.Errorf("invalid target %q (expected blinko, affine, or both)", raw)
+	}
+}
+
 func Load(path string) (Config, error) {
+	return LoadForTarget(path, TargetBoth)
+}
+
+func LoadForTarget(path string, target Target) (Config, error) {
 	var cfg Config
 
 	b, err := os.ReadFile(path)
@@ -63,7 +86,7 @@ func Load(path string) (Config, error) {
 	applyDefaults(&cfg)
 	applyEnvOverrides(&cfg)
 
-	if err := normalizeAndValidate(&cfg); err != nil {
+	if err := normalizeAndValidate(&cfg, target); err != nil {
 		return cfg, err
 	}
 	return cfg, nil
@@ -166,7 +189,7 @@ func overrideDuration(dst *time.Duration, env string) {
 	}
 }
 
-func normalizeAndValidate(cfg *Config) error {
+func normalizeAndValidate(cfg *Config, target Target) error {
 	cfg.Blinko.BaseURL = strings.TrimRight(strings.TrimSpace(cfg.Blinko.BaseURL), "/")
 	cfg.Blinko.JWTToken = strings.TrimSpace(cfg.Blinko.JWTToken)
 	cfg.Affine.BaseURL = strings.TrimRight(strings.TrimSpace(cfg.Affine.BaseURL), "/")
@@ -174,20 +197,24 @@ func normalizeAndValidate(cfg *Config) error {
 	cfg.Affine.WorkspaceID = strings.TrimSpace(cfg.Affine.WorkspaceID)
 	cfg.Watch.InputDir = filepath.Clean(strings.TrimSpace(cfg.Watch.InputDir))
 
-	if cfg.Blinko.BaseURL == "" {
-		return errors.New("blinko.base_url is required")
+	if target == TargetBoth || target == TargetBlinko {
+		if cfg.Blinko.BaseURL == "" {
+			return errors.New("blinko.base_url is required")
+		}
+		if cfg.Blinko.JWTToken == "" {
+			return errors.New("blinko.jwt_token is required")
+		}
 	}
-	if cfg.Blinko.JWTToken == "" {
-		return errors.New("blinko.jwt_token is required")
-	}
-	if cfg.Affine.BaseURL == "" {
-		return errors.New("affine.base_url is required")
-	}
-	if cfg.Affine.AuthToken == "" {
-		return errors.New("affine.auth_token is required")
-	}
-	if cfg.Affine.WorkspaceID == "" {
-		return errors.New("affine.workspace_id is required")
+	if target == TargetBoth || target == TargetAffine {
+		if cfg.Affine.BaseURL == "" {
+			return errors.New("affine.base_url is required")
+		}
+		if cfg.Affine.AuthToken == "" {
+			return errors.New("affine.auth_token is required")
+		}
+		if cfg.Affine.WorkspaceID == "" {
+			return errors.New("affine.workspace_id is required")
+		}
 	}
 	if cfg.Watch.InputDir == "." || cfg.Watch.InputDir == "" {
 		return errors.New("watch.input_dir is required")
